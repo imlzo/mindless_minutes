@@ -1,0 +1,196 @@
+#!/usr/bin/env sh
+
+# GLOBAL
+PROG=$(basename $0)
+TOKEN=""                                    # Auth token
+MEDITATION_UUID=""                          # Meditation UUID specifying a class
+
+# Config:
+DURATION=600                                # Min duration of meditation per day in seconds
+MEDITATION_TIME="07:00:00"                  # hh:mm:ss of when meditation starts each day
+UTC_OFFSET=-25200                           # UTC timezone offset
+JITTER_LIMIT=60                             # Add some time jitter
+DRY_RUN=0                                   # Whether or not this invokation is dry run
+
+# Constants
+SEC_IN_DAY=86400                            # Seconds in a day
+SESSION_JSON_FILE="sessions.json"           # File that JSON is written out to.
+
+# Usage: create_session_json START_DATE END_DATE DSTFILE
+# Create a JSON blob for meditation sessions from START_DATE to END_DATE, and save as DSTFILE
+# START_DATE and END_DATE are date strings in format "YYYY-MM-DD", e.g. "2021-10-20"
+create_session_json() {
+    START_DATE=$1
+    END_DATE=$2
+    DSTFILE=$3
+
+    # Unix timestamps
+    START_TS=$(date -ujf "%Y-%m-%d %T" "$START_DATE $MEDITATION_TIME" "+%s" 2>/dev/null)
+    if [ -z "$START_TS" ]; then
+        echo "Error: Start date \"$START_DATE $MEDITATION_TIME\" is not expected format \"YYYY-MM-DD HH:mm:ss\""
+        exit
+    fi
+
+    END_TS=$(date -ujf "%Y-%m-%d %T" "$END_DATE 23:59:59" "+%s" 2>/dev/null)
+    if [ -z "$END_TS" ]; then
+        echo "Error: End date \"$END_DATE\" is not expected format \"YYYY-MM-DD\""
+        exit
+    fi
+
+    # Adjust for timezone
+    START_TS=$(($START_TS - $UTC_OFFSET))
+    END_TS=$(($END_TS - $UTC_OFFSET))
+
+    # Build SESSIONS blobs
+    SESSIONS=""
+    TS="$START_TS"
+    while [ "$TS" -le "$END_TS" ]; do
+        START_JITTER=$(($RANDOM%$JITTER_LIMIT))
+        START_TIME=$(date -ujr "$(($TS - $START_JITTER))" "+%Y-%m-%dT%TZ")
+        END_JITTER=$(($RANDOM%$JITTER_LIMIT))
+        END_TIME=$(date -ujr "$(($TS + $DURATION + $END_JITTER))" "+%Y-%m-%dT%TZ")
+        SESSION_UUID=$(uuidgen | tr "A-Z" "a-z")
+        SESSION="{
+            \"source\":\"10% Happier\",
+            \"category\":\"meditation\",
+            \"uuid\":\"$SESSION_UUID\",
+            \"meditation_uuid\":\"$MEDITATION_UUID\",
+            \"course_session_uuid\":null,
+            \"podcast_episode_uuid\":null,
+            \"utc_offset\":$UTC_OFFSET,
+            \"start_date\":\"$START_TIME\",
+            \"end_date\":\"$END_TIME\"
+        }"
+
+        SEP=$([ -z "$SESSIONS" ] || echo ",")
+        SESSIONS="${SESSIONS}${SEP}${SESSION}"
+        TS=$(($TS + $SEC_IN_DAY))
+    done
+
+    JSON="{ \"mindful_sessions\": [ $SESSIONS ] }"
+
+    echo $JSON > $DSTFILE
+}
+
+# Usage: post_sessions SESSION_JSON_FILE TOKEN
+# Posts the JSON data in SESSION_JSON_FILE with auth token TOKEN
+post_sessions() {
+    SESSION_JSON_FILE=$1
+    TOKEN=$2
+    SESSION_JSON=$(cat $SESSION_JSON_FILE)
+    RES=$(curl \
+        -o /dev/null \
+        -s -w "%{http_code}\n" \
+        -H "Host: api.changecollective.com" \
+        -H "Authorization: Token token=$TOKEN" \
+        -H "Accept: */*" \
+        -H "TPH-Configuration: AppStore" \
+        -H "Accept-Language: en-US;q=1.0" \
+        -H "TPH-Platform: iOS" \
+        -H "Content-Type: application/json" \
+        -H "TPH-Platform-Version: 15.1" \
+        -H "TPH-Version: 6.2.2" \
+        -H "User-Agent: tenpercenthappier/6.2.2 (com.changecollective.tenpercenthappier; build:2021.10.13.15.04; iOS 15.1.0) Alamofire/5.2.2" \
+        -H "TPH-Build: 2021.10.13.15.04" \
+        -H "Pragma: no-cache" \
+        -H "Cache-Control: no-cache" \
+        --data-binary "$SESSION_JSON" \
+        --compressed "https://api.changecollective.com/api/v3/mindful_sessions/batch" 2>/dev/null)
+    if [ $RES = "200" ]; then
+        echo "Success: Session POST succeeded"
+    else
+        echo "Error: Session POST failed"
+    fi
+}
+
+print_usage() {
+    cat <<-EOF
+Usage: $PROG - Post meditation sessions every day in specified date range
+
+Required:
+    -T token                Authentication token
+    -M meditation_uuid      The meditation_uuid specifying an audio class
+
+Optional:
+    -s YYYY-MM-DD           Start date in YYYY-MM-DD format (Defaults to today)
+    -e YYYY-MM-DD           End date in YYYY-MM-DD format (Default to today)
+    -d seconds              Duration of meditation (Defaults to 600 seconds)
+    -t HH:mm:ss             The time to start meditation around each day. (Defaults to 07:00:00)
+    -j seconds              The "jitter" in time for each meditation session. (Defaults to 10 seconds)
+    -u seconds              The timezone offset. E.g. LA timezone is -7 which is -25200 seconds.
+    -D                      Dry run without posting. Inspect $SESSION_JSON_FILE for debugging.
+
+Examples:
+    Post meditation for today:
+        $PROG -T AUTH_TOKEN -M MEDITATION_UUID
+    Post meditation in range of dates:
+        $PROG -T AUTH_TOKEN -M MEDITATION_UUID -s "2021-10-01" -e "2021-10-30"
+EOF
+exit
+}
+
+main() {
+    START_DATE=$(date -j +%Y-%m-%d)
+    END_DATE=$START_DATE
+
+    while getopts "hT:M:s:e:d:t:j:u:D" arg; do
+        case $arg in
+            h)
+                print_usage
+                ;;
+            T)
+                TOKEN="$OPTARG"
+                ;;
+            M)
+                MEDITATION_UUID="$OPTARG"
+                ;;
+            s)
+                START_DATE="$OPTARG"
+                ;;
+            e)
+                END_DATE="$OPTARG"
+                ;;
+            d)
+                DURATION="$OPTARG"
+                ;;
+            t)
+                MEDITATION_TIME="$OPTARG"
+                ;;
+            j)
+                JITTER_LIMIT="$OPTARG"
+                ;;
+            u)
+                UTC_OFFSET="$OPTARG"
+                ;;
+            D)
+                DRY_RUN=1
+                ;;
+            *)
+                print_usage
+                ;;
+        esac
+    done
+
+    if [ -z "$TOKEN" ]; then
+        echo "Error: No token specified"
+        exit 2
+    fi
+    if [ -z "$MEDITATION_TIME" ]; then
+        echo "Error: No meditation_uuid specified"
+        exit 2
+    fi
+
+    if [ $START_DATE = $END_DATE ]; then
+        TIME_MSG="on $START_DATE"
+    else
+        TIME_MSG="from $START_DATE to $END_DATE"
+    fi
+    echo "Meditating for $DURATION seconds $TIME_MSG..."
+
+    create_session_json $START_DATE $END_DATE $SESSION_JSON_FILE
+    if [ $DRY_RUN -ne 1 ]; then
+        post_sessions $SESSION_JSON_FILE $TOKEN
+    fi
+}
+
+main $*
